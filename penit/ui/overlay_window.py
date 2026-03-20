@@ -175,6 +175,35 @@ class OverlayWindow(QWidget):
             grad.setColorAt(1, QColor(0, 230, 230, c1a))
             painter.fillRect(QRectF(rx, ry, w, h), grad)
 
+    def _point_alpha(self, i: int, n: int, age: float, fade: float, fade_start: float) -> float:
+        """Per-point alpha for sequential fade along stroke direction.
+
+        After release:
+        1. Hold at full opacity for fade_start * fade seconds
+        2. Then sweep from first point to last: each point fades with cubic ease
+        """
+        hold_time = fade * fade_start
+        active_fade = fade - hold_time  # remaining time for sequential fade
+
+        effective_age = age - hold_time
+        if effective_age <= 0.0:
+            return 1.0  # still in hold period
+
+        # Sweep takes 50% of active_fade, each point fades over 50%
+        sweep_dur = active_fade * 0.5
+        point_fade_dur = active_fade * 0.5
+
+        t = i / max(n - 1, 1)  # 0..1 position along stroke
+        delay = t * sweep_dur
+        local_age = effective_age - delay
+
+        if local_age <= 0.0:
+            return 1.0
+        if local_age >= point_fade_dur:
+            return 0.0
+        r = local_age / point_fade_dur
+        return 1.0 - r * r * r  # cubic ease out
+
     def _draw_stroke(self, painter, stroke, now, screen_geo):
         points = stroke.points
         n = len(points)
@@ -183,42 +212,48 @@ class OverlayWindow(QWidget):
 
         fade = self._manager.fade_duration
         fade_start = self._manager.fade_start_ratio
-        inv_fade_tail = 1.0 / (1.0 - fade_start) if fade_start < 1.0 else 1.0
         ox = screen_geo.x()
         oy = screen_geo.y()
 
-        # Still drawing (mouse held) -> full opacity, no fade
         released = stroke.release_time > 0
         if released:
-            age_since_release = now - stroke.release_time
-            if age_since_release >= fade:
+            age = now - stroke.release_time
+            if age >= fade:
                 return
-            r = age_since_release / fade
-            stroke_alpha = 1.0 if r < fade_start else 1.0 - ((r - fade_start) * inv_fade_tail) ** 3
         else:
-            stroke_alpha = 1.0
+            age = -1.0  # sentinel: still drawing
 
         if n == 1:
+            a = self._point_alpha(0, n, age, fade, fade_start) if released else 1.0
+            if a <= 0:
+                return
             p = points[0]
             c = QColor(p.color)
-            c.setAlpha(int(stroke_alpha * 255))
+            c.setAlpha(int(a * 255))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(c)
             painter.drawEllipse(QRectF(p.x-ox - p.size/2, p.y-oy - p.size/2, p.size, p.size))
             return
 
         if n == 2:
+            a = self._point_alpha(1, n, age, fade, fade_start) if released else 1.0
+            if a <= 0:
+                return
             p0, p1 = points
             c = QColor(p1.color)
-            c.setAlpha(int(stroke_alpha * 255))
+            c.setAlpha(int(a * 255))
             painter.setPen(QPen(c, p1.size, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
             painter.drawLine(int(p0.x-ox), int(p0.y-oy), int(p1.x-ox), int(p1.y-oy))
             return
 
-        # Two-pass rendering: 1) black outline  2) colored fill
-        a255 = int(stroke_alpha * 255)
+        # Build segments with per-point alpha
         segments = []
         for i in range(n - 1):
+            a = self._point_alpha(i + 1, n, age, fade, fade_start) if released else 1.0
+            a255 = int(a * 255)
+            if a255 <= 0:
+                continue
+
             p1 = points[i]
             p2 = points[i+1]
             p0 = points[i-1] if i > 0 else p1
@@ -231,10 +266,10 @@ class OverlayWindow(QWidget):
             path.moveTo(p1.x-ox, p1.y-oy)
             path.cubicTo(cp1x-ox, cp1y-oy, cp2x-ox, cp2y-oy, p2.x-ox, p2.y-oy)
 
-            segments.append((path, p2))
+            segments.append((path, p2, a255))
 
         # Pass 1: black outline (thicker)
-        for path, p2 in segments:
+        for path, p2, a255 in segments:
             sz = p2.size
             outline_sz = sz + 3
             bc = QColor(0, 0, 0, a255)
@@ -249,7 +284,7 @@ class OverlayWindow(QWidget):
             painter.drawEllipse(QRectF(p2.x-ox - half, p2.y-oy - half, outline_sz, outline_sz))
 
         # Pass 2: colored stroke on top
-        for path, p2 in segments:
+        for path, p2, a255 in segments:
             c = QColor(p2.color)
             c.setAlpha(a255)
             sz = p2.size
